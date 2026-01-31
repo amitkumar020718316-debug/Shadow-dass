@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Dash</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: 'Courier New', monospace;
+        }
+        canvas {
+            display: block;
+        }
+        #uiOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            color: #fff;
+            text-shadow: 0 0 5px #0ff;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            font-size: 20px;
+        }
+        #menu {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            font-size: 30px;
+        }
+        button {
+            background: #0ff;
+            border: none;
+            color: #000;
+            padding: 10px 20px;
+            margin: 10px;
+            font-size: 20px;
+            cursor: pointer;
+            text-shadow: none;
+            pointer-events: auto;
+            box-shadow: 0 0 10px #0ff;
+        }
+        #muteBtn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            font-size: 20px;
+            background: none;
+            border: none;
+            color: #fff;
+            cursor: pointer;
+            pointer-events: auto;
+            text-shadow: 0 0 5px #0ff;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <div id="uiOverlay">
+        <div id="hud"></div>
+        <div id="menu"></div>
+        <button id="muteBtn">🔊</button>
+    </div>
+    <script>
+        // Game Constants
+        const GAME_WIDTH = 800; // Base width for scaling
+        const GAME_HEIGHT = 600; // Base height for scaling
+        const GRAVITY = 0.5;
+        const JUMP_FORCE = -15;
+        const RUN_SPEED_BASE = 5;
+        const LEVEL_UP_SCORE = 1000;
+
+        // Game Variables
+        let canvas, ctx;
+        let scaleX = 1, scaleY = 1;
+        let gameState = 'menu'; // 'menu', 'running', 'paused', 'gameover'
+        let score = 0;
+        let lives = 3;
+        let level = 1;
+        let runSpeed = RUN_SPEED_BASE;
+        let player = { x: 100, y: GAME_HEIGHT - 100, vy: 0, jumping: false, trail: [] };
+        let obstacles = []; // Enemies/obstacles
+        let collectibles = []; // Score items
+        let powerups = [];
+        let particles = [];
+        let bgLayers = [
+            { speed: 0.5, offset: 0, color: '#111' }, // Far bg
+            { speed: 1, offset: 0, color: '#222' }, // Mid bg
+            { speed: 2, offset: 0, color: '#333' }  // Near bg
+        ];
+        let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let isMuted = false;
+        let bgMusicOscillator, sfxGainNode;
+
+        // Audio Setup
+        function initAudio() {
+            bgMusicOscillator = audioCtx.createOscillator();
+            bgMusicOscillator.type = 'sawtooth';
+            bgMusicOscillator.frequency.setValueAtTime(110, audioCtx.currentTime); // Low hum
+            let musicGain = audioCtx.createGain();
+            musicGain.gain.value = 0.1;
+            bgMusicOscillator.connect(musicGain);
+            musicGain.connect(audioCtx.destination);
+            bgMusicOscillator.start();
+
+            sfxGainNode = audioCtx.createGain();
+            sfxGainNode.gain.value = 0.3;
+            sfxGainNode.connect(audioCtx.destination);
+        }
+
+        function playSound(freq, duration, type = 'square') {
+            if (isMuted) return;
+            let osc = audioCtx.createOscillator();
+            osc.type = type;
+            osc.frequency.value = freq;
+            osc.connect(sfxGainNode);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function toggleMute() {
+            isMuted = !isMuted;
+            document.getElementById('muteBtn').textContent = isMuted ? '🔇' : '🔊';
+            if (isMuted) {
+                bgMusicOscillator.frequency.setValueAtTime(0, audioCtx.currentTime);
+            } else {
+                bgMusicOscillator.frequency.setValueAtTime(110, audioCtx.currentTime);
+            }
+        }
+
+        // Resize Handler
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            scaleX = canvas.width / GAME_WIDTH;
+            scaleY = canvas.height / GAME_HEIGHT;
+            ctx.scale(scaleX, scaleY);
+        }
+
+        // Input Handlers
+        let keys = {};
+        window.addEventListener('keydown', e => {
+            keys[e.key] = true;
+            if (e.key === ' ' || e.key === 'ArrowUp') jump();
+            if (e.key === 'p') pauseGame();
+        });
+        window.addEventListener('keyup', e => keys[e.key] = false);
+
+        let touchStartY = 0;
+        canvas.addEventListener('touchstart', e => {
+            touchStartY = e.touches[0].clientY;
+        });
+        canvas.addEventListener('touchend', e => {
+            let touchEndY = e.changedTouches[0].clientY;
+            if (touchEndY < touchStartY) jump(); // Swipe up to jump
+        });
+
+        function jump() {
+            if (!player.jumping && gameState === 'running') {
+                player.vy = JUMP_FORCE;
+                player.jumping = true;
+                playSound(440, 0.1); // Jump sound
+            }
+        }
+
+        // Particles
+        function createParticles(x, y, count, color) {
+            for (let i = 0; i < count; i++) {
+                particles.push({
+                    x, y,
+                    vx: Math.random() * 4 - 2,
+                    vy: Math.random() * 4 - 2,
+                    size: Math.random() * 5 + 5,
+                    life: 1,
+                    color
+                });
+            }
+        }
+
+        // Spawn Functions
+        function spawnEnemies() {
+            if (Math.random() < 0.02 * level) {
+                obstacles.push({
+                    x: GAME_WIDTH,
+                    y: Math.random() * (GAME_HEIGHT - 200) + 100,
+                    size: 30 + level * 5,
+                    speed: runSpeed + Math.random() * 2,
+                    type: 'drone'
+                });
+            }
+        }
+
+        function spawnCollectibles() {
+            if (Math.random() < 0.05) {
+                collectibles.push({
+                    x: GAME_WIDTH,
+                    y: Math.random() * (GAME_HEIGHT - 100),
+                    size: 10,
+                    type: 'orb'
+                });
+            }
+        }
+
+        function spawnPowerups() {
+            if (Math.random() < 0.01) {
+                powerups.push({
+                    x: GAME_WIDTH,
+                    y: Math.random() * (GAME_HEIGHT - 100),
+                    size: 15,
+                    type: 'shield' // Example power-up
+                });
+            }
+        }
+
+        // Collision Detection
+        function detectCollision(a, b) {
+            return Math.hypot(a.x - b.x, a.y - b.y) < (a.size + b.size) / 2;
+        }
+
+        // Update Score
+        function updateScore(points) {
+            score += points;
+            if (score >= level * LEVEL_UP_SCORE) {
+                level++;
+                runSpeed += 0.5;
+                playSound(880, 0.2); // Level up sound
+            }
+        }
+
+        // Apply Power-Up
+        function applyPowerUp(type) {
+            if (type === 'shield') {
+                lives = Math.min(lives + 1, 3); // Extra life
+                playSound(660, 0.15);
+            }
+        }
+
+        // Game Over
+        function gameOver() {
+            gameState = 'gameover';
+            playSound(220, 0.5, 'sawtooth'); // Game over sound
+            showMenu();
+        }
+
+        // Start Game
+        function startGame() {
+            gameState = 'running';
+            hideMenu();
+            playSound(550, 0.1);
+        }
+
+        // Pause Game
+        function pauseGame() {
+            if (gameState === 'running') {
+                gameState = 'paused';
+                showMenu();
+            } else if (gameState === 'paused') {
+                gameState = 'running';
+                hideMenu();
+            }
+        }
+
+        // Restart Game
+        function restartGame() {
+            score = 0;
+            lives = 3;
+            level = 1;
+            runSpeed = RUN_SPEED_BASE;
+            player.y = GAME_HEIGHT - 100;
+            player.vy = 0;
+            player.jumping = false;
+            obstacles = [];
+            collectibles = [];
+            powerups = [];
+            particles = [];
+            startGame();
+        }
+
+        // UI Functions
+        function showMenu() {
+            const menu = document.getElementById('menu');
+            if (gameState === 'menu') {
+                menu.innerHTML = `<h1>Neon Dash</h1><button onclick="startGame()">Start</button>`;
+            } else if (gameState === 'paused') {
+                menu.innerHTML = `<h1>Paused</h1><button onclick="pauseGame()">Resume</button><button onclick="restartGame()">Restart</button>`;
+            } else if (gameState === 'gameover') {
+                menu.innerHTML = `<h1>Game Over</h1><p>Score: ${score}</p><button onclick="restartGame()">Restart</button>`;
+            }
+            menu.style.display = 'block';
+        }
+
+        function hideMenu() {
+            document.getElementById('menu').style.display = 'none';
+        }
+
+        // Draw Functions
+        function drawBackground() {
+            bgLayers.forEach(layer => {
+                layer.offset = (layer.offset + layer.speed) % GAME_WIDTH;
+                ctx.fillStyle = layer.color;
+                ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+                // Simple parallax: draw lines for cityscape
+                ctx.strokeStyle = '#0ff';
+                ctx.lineWidth = 2;
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#0ff';
+                for (let i = -1; i < 2; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(-layer.offset + i * GAME_WIDTH, GAME_HEIGHT);
+                    ctx.lineTo(-layer.offset + i * GAME_WIDTH + 100, GAME_HEIGHT - 200);
+                    ctx.lineTo(-layer.offset + i * GAME_WIDTH + 200, GAME_HEIGHT);
+                    ctx.stroke();
+                }
+                ctx.shadowBlur = 0;
+            });
+        }
+
+        function drawPlayer() {
+            // Player trail particles
+            player.trail.push({ x: player.x, y: player.y, life: 1 });
+            player.trail = player.trail.filter(p => p.life > 0);
+            player.trail.forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 10 * p.life, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(0,255,255,${p.life * 0.5})`;
+                ctx.fill();
+                p.life -= 0.05;
+            });
+
+            // Player orb
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, 20, 0, Math.PI * 2);
+            ctx.fillStyle = '#0ff';
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = '#0ff';
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        function drawObstacles() {
+            obstacles.forEach(o => {
+                ctx.beginPath();
+                ctx.arc(o.x, o.y, o.size, 0, Math.PI * 2);
+                ctx.fillStyle = '#f00';
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#f00';
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+        }
+
+        function drawCollectibles() {
+            collectibles.forEach(c => {
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, c.size, 0, Math.PI * 2);
+                ctx.fillStyle = '#ff0';
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#ff0';
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+        }
+
+        function drawPowerups() {
+            powerups.forEach(p => {
+                ctx.beginPath();
+                ctx.rect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+                ctx.fillStyle = '#0f0';
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#0f0';
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+        }
+
+        function drawParticles() {
+            particles.forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255,0,0,${p.life})`; // Red for explosions
+                ctx.fill();
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life -= 0.02;
+            });
+            particles = particles.filter(p => p.life > 0);
+        }
+
+        function drawHUD() {
+            const hud = document.getElementById('hud');
+            hud.innerHTML = `Score: ${score} | Lives: ${lives} | Level: ${level}`;
+        }
+
+        // Update Game
+        function update() {
+            if (gameState !== 'running') return;
+
+            // Player physics
+            player.vy += GRAVITY;
+            player.y += player.vy;
+            if (player.y >= GAME_HEIGHT - 100) {
+                player.y = GAME_HEIGHT - 100;
+                player.vy = 0;
+                player.jumping = false;
+            }
+
+            // Move elements
+            obstacles.forEach(o => o.x -= o.speed);
+            collectibles.forEach(c => c.x -= runSpeed);
+            powerups.forEach(p => p.x -= runSpeed);
+
+            // Spawns
+            spawnEnemies();
+            spawnCollectibles();
+            spawnPowerups();
+
+            // Collisions
+            obstacles = obstacles.filter(o => {
+                if (detectCollision(player, o)) {
+                    lives--;
+                    createParticles(player.x, player.y, 20, '#f00');
+                    playSound(330, 0.2, 'sawtooth'); // Hit sound
+                    if (lives <= 0) gameOver();
+                    return false;
+                }
+                return o.x > -o.size;
+            });
+
+            collectibles = collectibles.filter(c => {
+                if (detectCollision(player, c)) {
+                    updateScore(100);
+                    createParticles(c.x, c.y, 10, '#ff0');
+                    playSound(660, 0.1); // Score sound
+                    return false;
+                }
+                return c.x > -c.size;
+            });
+
+            powerups = powerups.filter(p => {
+                if (detectCollision(player, p)) {
+                    applyPowerUp(p.type);
+                    createParticles(p.x, p.y, 15, '#0f0');
+                    return false;
+                }
+                return p.x > -p.size;
+            });
+        }
+
+        // Render Loop
+        function gameLoop() {
+            ctx.clearRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+            drawBackground();
+            drawPlayer();
+            drawObstacles();
+            drawCollectibles();
+            drawPowerups();
+            drawParticles();
+            drawHUD();
+            update();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Init
+        window.onload = () => {
+            canvas = document.getElementById('gameCanvas');
+            ctx = canvas.getContext('2d');
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+            document.getElementById('muteBtn').addEventListener('click', toggleMute);
+            initAudio();
+            showMenu();
+            gameLoop();
+        };
+    </script>
+</body>
+</html>
